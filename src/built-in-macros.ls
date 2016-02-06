@@ -1,4 +1,4 @@
-{ map, zip, concat-map } = require \prelude-ls
+{ map, zip, concat-map, fold1 } = require \prelude-ls
 { is-expression } = require \esutils .ast
 statementify = require \./es-statementify
 {
@@ -99,30 +99,29 @@ function-type = (type) -> (params, ...rest) ->
   params : params
   body : optionally-implicit-block-statement this, rest
 
-is-atom = (node, name) -> node.type is \atom and node.value is name
+is-atom = (node, name) ->
+  type-ok  = node.type is \atom
+  value-ok = if name then (node.value is name) else true
 
-unwrap-quote = (node, string-is-computed) ->
-  | node.type is \list and node.values.0 `is-atom` \quote =>
+  type-ok and value-ok
+
+is-list = (node) -> node.type is \list
+
+maybe-unwrap-quote = (node) ->
+  if (is-list node) and (is-atom node.values.0, \quote)
+
+    quoted-thing = node.values.1
+
+    unless is-atom quoted-thing
+      throw Error "Unexpected quoted property #{quoted-thing.type}: \
+                   expected atom"
+
     computed : false
-    node : node.values.1
-  | otherwise =>
+    node     : quoted-thing
+
+  else
     computed : true
-    node : node
-
-# For some final coercion after compilation, when building the ESTree AST.
-coerce-property = (node, computed, string-is-computed) ->
-  # This should be explicitly overridden and unconditional. Helps with minifiers
-  # and other things.
-  | string-is-computed and
-      node.type is \Literal and
-      typeof node.value isnt \object =>
-    node :
-      type : \Literal
-      value : node.value + ''
-    computed : false
-  | otherwise =>
-    node : node
-    computed : computed
+    node     : node
 
 contents =
   \+ : n-ary-expr \+
@@ -188,117 +187,122 @@ contents =
     elements : elements.map @compile
 
   \object : do
-    check-list = (list, i) ->
-      | list? and list.type is \list => list.values
-      | otherwise => throw Error "Expected property #i to be a list"
+    # This macro needs to detect patterns in its arguments, e.g.
+    #
+    #     (object (get 'a () (return 1)))
+    #
+    # where (get <something> <parameters> <body...>) is a pattern.  It is split
+    # into methods that handle different kinds of patterns.
 
-    infer-name = (prefix, name, computed) ->
-      if computed
-        prefix
-      else if typeof name.type is \Literal
-        "#prefix #{name.value}"
-      else
-        "#prefix #{name.name}"
+    # Specific Error type, to be thrown just in this macro when the user has
+    # provided an invalid argument pattern.
+    #
+    # This makes error handling neater: the top-level macro function catches
+    # this type of Errors and prepends information about which parameter was
+    # being processed when it occurred.
+    class ObjectParamError extends Error
+      (@message) ~>
 
-    compile-get-set = (i, type, [name, params, ...body]) ->
+    compile-get-set = (kind, [name, ...function-macro-arguments-part]) ->
+      # kind is either "get" or "set"
+
+      # What the thing being compiled is called in human-readable errors
+      readable-kind-name = kind + "ter"
+
       if not name?
-        throw Error "Expected #{type}ter in property #i to have a name"
+        throw ObjectParamError "No #readable-kind-name name"
 
-      {node, computed} = unwrap-quote name, true
+      {node, computed} = maybe-unwrap-quote name
 
-      unless computed or node.type is \atom
-        throw Error "Expected name of #{type}ter in property #i to be a quoted
-          atom or an expression"
+      name = @compile node
+      if name.kind is \Literal
+        computed := false
 
-      {node : name, computed} = coerce-property (@compile node), computed, true
-      kind = infer-name "#{type}ter", name, computed
+      # We'll only check the parameters here; the function expression macro can
+      # check the body.
+      [ params, _ ] = function-macro-arguments-part
 
-      unless params?.type is \list
-        throw Error "Expected #{kind} in property #i to have a parameter list"
+      unless is-list params
+        throw ObjectParamError "Unexpected #readable-kind-name part \
+                                (got #{params.type}; \
+                                expected list of parameters)"
 
       params .= values
 
       # Catch this error here, to return a more sensible, helpful error message
       # than merely an InvalidAstError referencing property names from the
       # stringifier itself.
-      if type is \get
-        if params.length isnt 0
-          throw Error "Expected #{kind} in property #i to have no parameters"
-      else # type is \set
-        if params.length isnt 1
-          throw Error "Expected #{kind} in property #i to have exactly one \
-                       parameter"
-        param = params.0
-        if param.type isnt \atom
-          throw Error "Expected parameter for #{kind} in property #i to be an \
-                       identifier"
-        params = [
-          type : \Identifier
-          name : param.value
-        ]
+      switch
+      | kind is \get and params.length isnt 0
+          throw ObjectParamError "Expected #readable-kind-name to have \
+                                  no parameters (got #{params.length})"
+      | kind is \set and params.length isnt 1
+          throw ObjectParamError "Expected #readable-kind-name to have \
+                                  exactly one parameter (got #{params.length})"
 
       type : \Property
-      kind : type
+      kind : kind
       key : name
       # The initial check doesn't cover the compiled case.
       computed : computed
-      value :
-        type : \FunctionExpression
-        id : null
-        params : params
-        body : optionally-implicit-block-statement this, body
-        expression : false
+      value : do
+        (function-type \FunctionExpression)
+          .apply this, function-macro-arguments-part
 
-    compile-method = (i, [name, params, ...body]) ->
-      if not name?
-        throw Error "Expected method in property #i to have a name"
+    compile-method = (args) ->
 
-      {node, computed} = unwrap-quote name, true
+      if args.length is 0
+        throw ObjectParamError "Method has no name or argument list"
 
-      unless computed or node.type is \atom
-        throw Error "Expected name of method in property #i to be a quoted atom
-          or an expression"
+      [name, ...function-macro-arguments-part] = args
 
-      {node : name, computed} = coerce-property (@compile node), computed, true
-      method = infer-name 'method', name, computed
+      if not name? then throw ObjectParamError "Method has no name"
 
-      if not params? or params.type isnt \list
-        throw Error "Expected #method in property #i to have a parameter \
-                     list"
+      [ params, _ ] = function-macro-arguments-part
 
-      params = for param, j in params.values
-        if param.type isnt \atom
-          throw Error "Expected parameter #j for #method in property #i to be \
-                       an identifier"
-        type : \Identifier
-        name : param.value
+      {node, computed} = maybe-unwrap-quote name
+
+      name := @compile node
+      if name.type is \Literal
+        computed := false
+
+      readable-kind-name = 'method'+ switch name.type is \Identifier
+                                     | true  => " '#{name.name}'"
+                                     | false => ""
+
+      if not params? or not is-list params
+        throw ObjectParamError "Expected #readable-kind-name to have an \
+                                argument list"
 
       type : \Property
       kind : \init
       method : true
       computed : computed
       key : name
-      value :
-        type : \FunctionExpression
-        id : null
-        params : params
-        body : optionally-implicit-block-statement this, body
-        expression : false
+      value : do
+        (function-type \FunctionExpression)
+          .apply this, function-macro-arguments-part
 
-    compile-list = (i, args) ->
+    compile-property-list = (args) ->
       | args.length is 0 =>
-        throw Error "Expected at least two arguments in property #i"
+        throw ObjectParamError "Got empty list (expected list to have contents)"
 
+      | is-atom args.0 and (args.0.value is \method) =>
+        compile-method.call this, args[1 til]
+
+      | is-atom args.0 and (args.0.value in <[ get set ]>) =>
+        compile-get-set.call this, args.0.value, args[1 til]
+
+      | args.0 `is-atom` \* =>
+        # TODO Implement
+        throw ObjectParamError "Unexpected '*' (generator methods not yet implemented)"
       | args.length is 1 =>
         node = args.0
 
-        if node.type isnt \list
-          throw Error "Expected name in property #i to be a quoted atom"
-
         [type, node] = node.values
 
-        unless type `is-atom` \quote and node.type is \atom
-          throw Error "Expected name in property #i to be a quoted atom"
+        unless (is-atom type, \quote) and is-atom node
+          throw ObjectParamError "Invalid single-element list (expected a pattern of (quote <atom>))"
 
         type : \Property
         kind : \init
@@ -310,14 +314,18 @@ contents =
           name : node.value
         shorthand : true
 
-      | args.length is 2 =>
-        {node, computed} = unwrap-quote args.0, true
 
-        if not computed and node.type isnt \atom
-          throw Error "Expected name of property #i to be an expression or
-            quoted atom"
+      | otherwise # Assume a key-value pair for a normal object Property
+        if args.length isnt 2
+          throw Error "Not getter, setter, method, or shorthand property, \
+                       but length is #{args.length} \
+                       (expected 2: key and value)"
 
-        {node : key, computed} = coerce-property (@compile node), computed, true
+        {node, computed} = maybe-unwrap-quote args.0
+
+        key = @compile node
+        if key.type is \Literal
+          computed := false
 
         type : \Property
         kind : \init
@@ -325,22 +333,23 @@ contents =
         key : key
         value : @compile args.1
 
-      # Check this before compilation and macro resolution to ensure that
-      # neither can affect this, but that it can be avoided in the edge case if
-      # needed with `(id get)` or `(id set)`, where `(macro id (lambda (x) x))`.
-      | args.0 `is-atom` \get or args.0 `is-atom` \set =>
-        compile-get-set.call this, i, args.0.value, args[1 til]
-
-      # Reserve this for future generator use.
-      | args.0.type `is-atom` \* =>
-        throw Error "Unexpected generator method in property #i"
-
-      | otherwise => compile-method.call this, i, args
-
-    ->
+    (...args) ->
       type : \ObjectExpression
-      properties : for args, i in arguments
-        compile-list.call this, i, (check-list args, i)
+      properties : args.map (arg, i) ~>
+
+        if is-list arg
+          try
+            compile-property-list.call @, arg.values
+          catch e
+            # To object parameter errors, prepend the argument index.
+            if e instanceof ObjectParamError
+              e.message = "Unexpected object macro argument #i: " + e.message
+
+            throw e
+
+        else
+          throw Error "Unexpected object macro argument #i: \
+                       Got #{arg.type} (expected list)"
 
   \var : (name, value) ->
     if &length > 2
@@ -432,29 +441,26 @@ contents =
     argument : @compile arg
 
   \. : do
-    join-members = (host, prop) ->
-      {node, computed} = unwrap-quote prop, false
 
-      if not computed and node.type isnt \atom
-        throw Error "Expected quoted name of property getter to be an atom"
+    join-as-member-expression = (host-node, prop-node) ->
 
-      {node : prop, computed} = coerce-property (@compile node), computed, false
+      host = @compile host-node
+
+      { node : prop-node, computed } = maybe-unwrap-quote prop-node
+
+      prop = @compile prop-node
 
       type : \MemberExpression
       computed : computed
       object   : host
       property : prop
 
-    (host) ->
-      switch
+    ->
       | &length is 0 => throw Error "dot called with no arguments"
-      | &length is 1 => @compile host
-      | &length is 2 => join-members.call this, (@compile host), &1
+      | &length is 1 => @compile &0
       | otherwise =>
-        host = @compile host
-        for i from 1 til &length
-          host = join-members.call this, host, &[i]
-        host
+        [].slice.call arguments
+        |> fold1 join-as-member-expression.bind @
 
   \lambda : function-type \FunctionExpression
 

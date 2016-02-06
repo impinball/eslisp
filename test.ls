@@ -717,6 +717,10 @@ test "array macro can be empty" ->
   esl "(array)"
     ..`@equals` "[];"
 
+test "object macro can be empty" ->
+  esl "(object)"
+    ..`@equals` "({});"
+
 test "object macro produces object expression" ->
   esl "(object ('a 1) ('b 2))"
     ..`@equals` "({\n    a: 1,\n    b: 2\n});"
@@ -741,9 +745,17 @@ test "object macro can create getters" ->
   esl '(object (get \'a () (return 1)))'
     ..`@equals` '({\n    get a() {\n        return 1;\n    }\n});'
 
+test "object macro can create getters with empty body" ->
+  esl '(object (get \'a ()))'
+    ..`@equals` '({\n    get a() {\n    }\n});'
+
 test "object macro can create setters" ->
   esl '(object (set \'a (x) (return 1)))'
     ..`@equals` '({\n    set a(x) {\n        return 1;\n    }\n});'
+
+test "object macro can create setters with empty body" ->
+  esl '(object (set y (x)))'
+    ..`@equals` '({\n    set [y](x) {\n    }\n});'
 
 test "object macro can create computed getters and setters" ->
   esl '(object (get a ()) (set a (x)))'
@@ -759,9 +771,10 @@ test "object macro can create computed getters and setters" ->
 test "object macro's parts can be ES6 methods" ->
   esl '''
       (object
-        ('a () (return 1))
-        ('b (x) (return (+ x 1)))
-        (c (x y) (return (+ x y 1))))
+        (method 'a () (return 1))
+        (method 'b (x) (return (+ x 1)))
+        (method c (x y) (return (+ x y 1)))
+        (method 'd ())) ; no args, empty method body
       '''
     ..`@equals` """
       ({
@@ -773,6 +786,8 @@ test "object macro's parts can be ES6 methods" ->
           },
           [c](x, y) {
               return x + (y + 1);
+          },
+          d() {
           }
       });
       """
@@ -796,10 +811,10 @@ test "object macro compiles complex ES6 object" ->
         (set (. syms 'Sym) (value)
           ((. wm 'set) this value))
 
-        ('printFoo ()
+        (method 'printFoo ()
           ((. console 'log) (. this 'foo)))
 
-        ('concatFoo (value)
+        (method 'concatFoo (value)
           (return (+ (. this 'foo) value))))
       '''
     ..`@equals` '''
@@ -827,6 +842,75 @@ test "object macro compiles complex ES6 object" ->
         }
     });
     '''
+
+test "object macro empty list argument raises error" ->
+  try
+    esl '(object ())'
+  catch e
+    e.message `@equals` "Unexpected object macro argument 0: Got empty list (expected list to have contents)"
+    return
+  @fail "No error thrown"
+
+test "object macro non-list argument raises error" ->
+  try
+    esl '(object "hi")'
+  catch e
+    e.message `@equals` "Unexpected object macro argument 0: Got string (expected list)"
+    return
+  @fail "No error thrown"
+
+test "object macro not-a-quoted-atom in argument raises error" ->
+  try
+    esl '(object ((a x)))'
+  catch e
+    e.message `@equals` "Unexpected object macro argument 0: Invalid single-element list (expected a pattern of (quote <atom>))"
+    return
+  @fail "No error thrown"
+
+test "object macro setter with bad argument list raises error" ->
+  try
+    esl '(object (set x x))'
+  catch e
+    e.message `@equals` 'Unexpected object macro argument 0: Unexpected setter part (got atom; expected list of parameters)'
+
+    return
+  @fail "No error thrown"
+
+test "object macro setter with no arguments raises error" ->
+  try
+    esl '(object (set x ()))'
+  catch e
+    e.message `@equals` 'Unexpected object macro argument 0: Expected setter to have exactly one parameter (got 0)'
+
+    return
+  @fail "No error thrown"
+
+test "object macro getter with arguments raises error" ->
+  try
+    esl '(object (get x (y)))'
+  catch e
+    e.message `@equals` 'Unexpected object macro argument 0: Expected getter to have no parameters (got 1)'
+
+    return
+  @fail "No error thrown"
+
+test "object macro method with no name raises error" ->
+  try
+    esl '(object (method))'
+  catch e
+    e.message `@equals` 'Unexpected object macro argument 0: Method has no name or argument list'
+
+    return
+  @fail "No error thrown"
+
+test "object macro method with no argument list raises error" ->
+  try
+    esl '(object (method \'x))'
+  catch e
+    e.message `@equals` 'Unexpected object macro argument 0: Expected method \'x\' to have an argument list'
+
+    return
+  @fail "No error thrown"
 
 test "macro producing an object literal" ->
   esl "(macro obj (lambda () (return '(object ('a 1)))))
